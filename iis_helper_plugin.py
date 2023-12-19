@@ -261,6 +261,9 @@ class IISHelper:
                                 continue
                             
                             func_addr_to_check = idc.get_qword(forward_check_addr)
+                            # This value may not always be a function
+                            if not ida_funcs.get_func(func_addr_to_check):
+                                continue
                             func_name_to_check = ida_funcs.get_func_name(func_addr_to_check)
                             
                             if func_name_to_check.startswith("sub_"):
@@ -281,6 +284,9 @@ class IISHelper:
                                 continue
                             
                             func_addr_to_check = idc.get_qword(backward_check_addr)
+                            # This value may not always be a function
+                            if not ida_funcs.get_func(func_addr_to_check):
+                                continue
                             func_name_to_check = ida_funcs.get_func_name(func_addr_to_check)
                             
                             if func_name_to_check.startswith("sub_"):
