@@ -24,6 +24,7 @@ import ida_name
 import ida_segment
 import ida_hexrays
 import idaapi
+import ida_kernwin
 
 import iis_helper_classes
 
@@ -136,10 +137,16 @@ class IISHelper:
     def __init__(self):
         self.is_cglobalmodule = False
         self.is_chttpmodule = False
+        self.module_str = ""
+        self.iis_module_func_names = []
+        
+        self.not_implemented_func_addresses = {}
+        self.implemented_func_addresses = {}
         
         self.ida_strings = idautils.Strings()
         
     def create_classes(self):
+        """Add all relevant IIS classes to the local types."""
         # Add initial classes
         ida_srclang.parse_decls_with_parser("<default>", None, iis_helper_classes.IIS_CLASSES, False)
     
@@ -148,7 +155,7 @@ class IISHelper:
         ida_srclang.parse_decls_with_parser("<default>", None, iis_helper_classes.IIS_CLASSES_UPDATE, False)
         
     def create_enums(self):
-        
+        """Add all enumeration types to the database."""
         rdn_enum_id = idc.add_enum(-1, "iis_request_deterministic_notifications", ida_bytes.hex_flag())
         idc.add_enum_member(rdn_enum_id, "RQ_BEGIN_REQUEST", 0x00000001, -1)
         idc.add_enum_member(rdn_enum_id, "RQ_AUTHENTICATE_REQUEST", 0x00000002, -1)
@@ -187,28 +194,35 @@ class IISHelper:
         idc.add_enum_member(gn_enum_id, "GL_APPLICATION_PRELOAD", 0x00010000, -1)
         
     def determine_iis_module_type(self):
+        """Determine the type of IIS module we're dealing with, either a
+        'CGlobalModule' or 'CHttpModule', and set relevant variables.
+        """
         for ida_string in self.ida_strings:
             if str(ida_string) == ".?AVCGlobalModule@@":
                 self.is_cglobalmodule = True
+                self.module_str = "CGlobalModule"
+                self.iis_module_func_names = self.cglobalmodule_funcs
                 return True
                 
             elif str(ida_string) == ".?AVCHttpModule@@":
                 self.is_chttpmodule = True
+                self.module_str = "CHttpModule"
+                self.iis_module_func_names = self.chttpmodule_funcs
                 return True
                 
-        print("Could not determine IIS module type.")
+        ida_kernwin.info("Could not determine IIS module type - sample may not be an IIS module.")
         return False
+    
+    def label_not_implemented_funcs_via_xref(self):
+        """This function will attempt to relabel not implemented IIS methods based
+        on the cross references from the logging strings used to detail that the
+        IIS method hasn't been implemented.
+        """
         
-    def label_not_implemented_funcs(self, iis_module_func_names):
-        not_implemented_func_addresses = {}
-        
-        for func_name in iis_module_func_names:
-            not_implemented_func_addresses[func_name] = set()
-
         for ida_string in self.ida_strings:
             
-            for iis_module_func_name in iis_module_func_names:
-                if iis_module_func_name in str(ida_string):
+            for iis_module_func_name in self.iis_module_func_names:
+                if f"{self.module_str}::{iis_module_func_name}" in str(ida_string):
                     
                     string_address = ida_string.ea
                     
@@ -222,99 +236,203 @@ class IISHelper:
                     func = ida_funcs.get_func(address_in_func)
                     
                     # https://www.hex-rays.com/products/ida/support/idadoc/203.shtml
-                    ida_name.set_name(func.start_ea, f"not_impl_{iis_module_func_name}", ida_name.SN_FORCE)
+                    not_implemented_name = f"not_impl_{iis_module_func_name}"
+                    print(f"[IIS Relabelling] Renaming address to {not_implemented_name}: {hex(func.start_ea)}")
+                    ida_name.set_name(func.start_ea, not_implemented_name, ida_name.SN_FORCE)
                     
-                    not_implemented_func_addresses[iis_module_func_name].add(func.start_ea)
+                    self.not_implemented_func_addresses[iis_module_func_name].add(func.start_ea)
                     
                     break
                     
-        return not_implemented_func_addresses
+        return
+            
+    def label_not_implemented_funcs(self):
+        """Label known not implemented functions, primarily through 
+        searching cross references of non-implemented virtual method strings.
+        """
+        for func_name in self.iis_module_func_names:
+            self.not_implemented_func_addresses[func_name] = set()
+
+        self.label_not_implemented_funcs_via_xref()
+
+        return
         
-    def label_implemented_funcs(self, iis_module_func_names, not_implemented_func_addresses):
-        implemented_func_addresses = {}
-        addresses_checked = set()
+    def label_directional_funcs(self, steps_to_check, next_check_addr, addresses_checked, number_of_steps_in, backward_flag=False):
+        """Search forwards or backwards from known addresses for a set number of steps_to_check
+        to perform relabelling of known IIS subroutines.
+        """
+        # If looking forwards, subtract 1 to not overshoot
+        if not backward_flag:
+            steps_to_check -= 1
+            
+        for i in range(0, steps_to_check):
+            if backward_flag:
+                next_check_addr = idc.prev_head(next_check_addr)
+                
+            else:
+                next_check_addr = idc.next_head(next_check_addr)
+                
+            if next_check_addr in addresses_checked:
+                continue
+                
+            func_addr_to_check = idc.get_qword(next_check_addr)
+            func_name_to_check = ida_funcs.get_func_name(func_addr_to_check)
+            
+            if func_name_to_check.startswith("sub_"):
+                if backward_flag:
+                    func_name = self.iis_module_func_names[-(i+number_of_steps_in-1)]
+                    
+                else:
+                    func_name = self.iis_module_func_names[i+number_of_steps_in+1]
+                
+                print(f"[IIS Relabelling] Renaming address to {func_name}: {hex(func_addr_to_check)}")
+                ida_name.set_name(func_addr_to_check, func_name, ida_name.SN_FORCE)
+                self.implemented_func_addresses[func_name].add(func_addr_to_check)
+                
+            addresses_checked.add(next_check_addr)
+            
+        return addresses_checked
         
-        for func_name in iis_module_func_names:
-            implemented_func_addresses[func_name] = set()
-        
-        to_forward_check = len(iis_module_func_names) - 1
+    def label_implemented_funcs_via_non_implemented_search(self, addresses_checked):
+        """Iterate over addresses of non-implemented IIS methods and
+        using cross references to these, find nearby implemented IIS methods
+        through forwards and backwards searches
+        """
+        to_forward_check = len(self.iis_module_func_names) - 1
         to_backward_check = 0
+        number_of_steps_in = 0
         
-        for iis_func_name in iis_module_func_names:
-            if not_implemented_func_addresses[iis_func_name]:
+        for iis_func_name in self.iis_module_func_names:
+            if self.not_implemented_func_addresses[iis_func_name]:
                 # TODO: iterate over all not implemented addresses
-                xrefs = idautils.XrefsTo(list(not_implemented_func_addresses[iis_func_name])[0])
+                xrefs = idautils.XrefsTo(list(self.not_implemented_func_addresses[iis_func_name])[0])
                 
                 for xref in xrefs:
-                    segm_name = ida_segment.get_segm_name(ida_segment.getseg(xref.frm))
+                    try:
+                        segm_name = ida_segment.get_segm_name(ida_segment.getseg(xref.frm))
                     
-                    if segm_name != ".pdata":
+                        # Rule out a false positive section
+                        if segm_name != ".pdata":
                         
-                        forward_check_addr = xref.frm
-                        backward_check_addr = xref.frm
+                            forward_check_addr = xref.frm
+                            backward_check_addr = xref.frm
                         
-                        # Iterate forward through unknown routines
-                        for i in range(0, to_forward_check - 1):
-                            forward_check_addr = idc.next_head(forward_check_addr)
+                            addresses_checked = self.label_directional_funcs(to_forward_check, forward_check_addr, addresses_checked, number_of_steps_in, backward_flag=False)
+                            addresses_checked = self.label_directional_funcs(to_backward_check, backward_check_addr, addresses_checked, number_of_steps_in, backward_flag=True)
                             
-                            if forward_check_addr in addresses_checked:
-                                continue
-                            
-                            func_addr_to_check = idc.get_qword(forward_check_addr)
-                            func_name_to_check = ida_funcs.get_func_name(func_addr_to_check)
-                            
-                            if func_name_to_check.startswith("sub_"):
-                                
-                                func_name = iis_module_func_names[i+1]
-                                
-                                ida_name.set_name(func_addr_to_check, func_name, ida_name.SN_FORCE)
-                                
-                                implemented_func_addresses[func_name].add(func_addr_to_check)
-                                
-                            addresses_checked.add(forward_check_addr)
-                                
-                        # Also iterate backwards if we need to
-                        for i in range(0, to_backward_check):
-                            backward_check_addr = idc.prev_head(backward_check_addr)
-                            
-                            if backward_check_addr in addresses_checked:
-                                continue
-                            
-                            func_addr_to_check = idc.get_qword(backward_check_addr)
-                            func_name_to_check = ida_funcs.get_func_name(func_addr_to_check)
-                            
-                            if func_name_to_check.startswith("sub_"):
-                                # TODO: check whether I can make this less hacky...
-                                func_name = iis_module_func_names[-(i+3)]
-                                
-                                ida_name.set_name(func_addr_to_check, func_name, ida_name.SN_FORCE)
-                                
-                                implemented_func_addresses[func_name].add(func_addr_to_check)
-                                
-                            addresses_checked.add(backward_check_addr)
+                    except:
+                        continue
                                 
                         
             to_forward_check -= 1
             to_backward_check += 1
+            number_of_steps_in += 1
             
-        return implemented_func_addresses
+        return
+        
+    def label_fixed_block(self, start_addr):
+        """Function to label a fixed block of IIS functions
+        assuming that we know the start address of the block
+        """
+        
+        current_addr = start_addr
+        
+        for func_name in self.iis_module_func_names:
+            
+            func_addr_to_check = idc.get_qword(current_addr)
+            func_name_to_check = ida_funcs.get_func_name(func_addr_to_check)
+            
+            if func_name_to_check and func_name_to_check.startswith("sub_"): 
+                ida_name.set_name(func_addr_to_check, func_name, ida_name.SN_FORCE)
+                self.implemented_func_addresses[func_name].add(func_addr_to_check)
+                
+            current_addr = idc.next_head(current_addr)
+        
+    def check_vftable_block(self, current_addr):
+        """Function to start at a candidate IIS method block
+        and see if each method is a subroutine which matches the expected
+        size of implemented IIS methods
+        """
+        counter = 1
+
+        candidate_start_addr = current_addr
+        
+        current_addr = idc.next_head(current_addr)
+        
+        for i in range(1, len(self.iis_module_func_names)):
+            func_addr_to_check = idc.get_qword(current_addr)
+            func_name_to_check = ida_funcs.get_func_name(func_addr_to_check)
+            
+            addr_name = ida_name.get_ea_name(current_addr, ida_name.GN_DEMANGLED)
+        
+            if func_name_to_check and func_name_to_check.startswith("sub_") and "vftable" not in addr_name:
+                
+                counter += 1
+                current_addr = idc.next_head(current_addr)
+                
+            else:
+                break
+                
+        if counter == len(self.iis_module_func_names):
+            self.label_fixed_block(candidate_start_addr)
+            
+        return current_addr
+        
+    def label_implemented_funcs_via_subroutine_block(self):
+        """This function will attempt to relabel not implemented IIS methods based on
+        sequential blocks of subroutines that fit the expected length of the current
+        IIS class that the module has inherited from
+        """
+        
+        section_name = ".rdata"
+        
+        seg = ida_segment.get_segm_by_name(section_name)
+        
+        if seg:
+            current_addr = seg.start_ea
+            end_addr = seg.end_ea
+            
+            while current_addr <= end_addr:
+                    
+                # Using GN_DEMANGLED means we can find vftables, e.g.:
+                # const CMyHttpModule::`vftable'
+                addr_name = ida_name.get_ea_name(current_addr, ida_name.GN_DEMANGLED)
+                
+                if addr_name:
+                    if "vftable" in addr_name:
+                        current_addr = self.check_vftable_block(current_addr)
+            
+                current_addr = idc.next_head(current_addr)
+        
+        return
+        
+    def label_implemented_funcs(self):
+        """Call multiple functions to label known implemented
+        IIS methods
+        """
+        addresses_checked = set()
+        
+        for iis_module_func_name in self.iis_module_func_names:
+            self.implemented_func_addresses[iis_module_func_name] = set()
+        
+        self.label_implemented_funcs_via_non_implemented_search(addresses_checked)
+        self.label_implemented_funcs_via_subroutine_block()
+
+        return
     
     def relabel_iis_funcs(self):
+        """Main method for relabelling IIS functions"""
         
         if not self.determine_iis_module_type():
-            return
-            
-        if self.is_cglobalmodule:
-            not_implemented_func_addresses = self.label_not_implemented_funcs(self.cglobalmodule_funcs)
-            implemented_func_addresses = self.label_implemented_funcs(self.cglobalmodule_funcs, not_implemented_func_addresses)
-            
-        elif self.is_chttpmodule:
-            not_implemented_func_addresses = self.label_not_implemented_funcs(self.chttpmodule_funcs)
-            implemented_func_addresses = self.label_implemented_funcs(self.chttpmodule_funcs, not_implemented_func_addresses)
+            return False
+        
+        self.label_not_implemented_funcs()
+        self.label_implemented_funcs()
 
-        return implemented_func_addresses
+        return True
         
     def retype_registermodule_export(self):
+        """Function to retype the RegisterModule export of an IIS module"""
         for entry in idautils.Entries():
             export_address = entry[2]
             export_name = entry[3]
@@ -329,11 +447,14 @@ class IISHelper:
 
         idc.SetType(register_module_export_addr, "HRESULT __stdcall RegisterModule(DWORD dwServerVersion, IHttpModuleRegistrationInfo* pModuleInfo, IHttpServer* pGlobalInfo);")
         
-    def retype_iis_funcs(self, implemented_func_addresses):
+    def retype_iis_funcs(self):
+        """Given a list of known implemented IIS methods
+        apply known function prototypes to them
+        """
         
         self.retype_registermodule_export()
         
-        for func_name, addresses in implemented_func_addresses.items():
+        for func_name, addresses in self.implemented_func_addresses.items():
             for func_addr in addresses:
                 if self.is_cglobalmodule:
                     idc.SetType(func_addr, self.cglobalmodule_func_prototypes[func_name])
@@ -342,51 +463,64 @@ class IISHelper:
                     idc.SetType(func_addr, self.chttpmodule_func_prototypes[func_name])
                     
     def iis_variable_retype_handler(self, func_ea):
+        """Handler to retype variables in known implemented
+        IIS methods. We run this method many times to try and
+        retype as many variables as we can based on refreshing
+        decompiler outputs
+        """
         max_iter = 100
         edited_variable_names = []
         
         cfunc_t = ida_hexrays.decompile(func_ea)
         ctree_visitor = iis_ctree_visitor(cfunc_t)
         
-        while max_iter:
-            vars_edited = False
+        if cfunc_t:
+            while max_iter:
+                vars_edited = False
+                
+                ctree_visitor.apply_to(cfunc_t.body, None)
             
-            ctree_visitor.apply_to(cfunc_t.body, None)
-        
-            cfunc_t.build_c_tree()
-            cfunc_t.refresh_func_ctext()
-            
-            # These variables may change between updates of the ctree_visitor
-            # But it is good enough to make sure we don't run it too many times
-            updated_edited_variable_names = ctree_visitor.get_edited_variable_names()
-            
-            for var_name in updated_edited_variable_names:
-                if var_name not in edited_variable_names:
-                    edited_variable_names.append(var_name)
-                    vars_edited = True
-                    
-            if not vars_edited:
-                break
-            
-            max_iter -= 1
+                cfunc_t.build_c_tree()
+                cfunc_t.refresh_func_ctext()
+                
+                # These variables may change between updates of the ctree_visitor
+                # But it is good enough to make sure we don't run it too many times
+                updated_edited_variable_names = ctree_visitor.get_edited_variable_names()
+                
+                for var_name in updated_edited_variable_names:
+                    if var_name not in edited_variable_names:
+                        edited_variable_names.append(var_name)
+                        vars_edited = True
+                        
+                if not vars_edited:
+                    break
+                
+                max_iter -= 1
     
-    def retype_iis_variables(self, implemented_func_addresses):
+    def retype_iis_variables(self):
+        """Retype as many variables as we can in IIS implemented methods
+        by calling the handler multiple times to fully refresh the 
+        decompiler output
+        """
         max_retype_rerun = 3
         
-        for func_name, addresses in implemented_func_addresses.items():
+        for func_name, addresses in self.implemented_func_addresses.items():
             for func_addr in addresses:
                 for i in range(0, max_retype_rerun):
                     self.iis_variable_retype_handler(func_addr)
         
     def main(self):
+        """Main method to handle all IIS renaming/retyping"""
         self.create_classes()
         self.create_enums()
         
-        implemented_func_addresses = self.relabel_iis_funcs()
+        if not self.relabel_iis_funcs():
+            return
         
-        self.retype_iis_funcs(implemented_func_addresses)
-
-        self.retype_iis_variables(implemented_func_addresses)
+        self.retype_iis_funcs()
+        self.retype_iis_variables()
+        
+        return
         
 class iis_ctree_visitor(idaapi.ctree_visitor_t):
     
